@@ -31,20 +31,23 @@ class AudioProcessor(AudioProcessorBase):
         self.audio_queue = queue.Queue()
         self.stop_event = threading.Event()
         self.transcription_thread = None
+        self.lock = threading.Lock()
 
     def recv(self, frame):
         self.audio_queue.put(frame.to_ndarray())
         return frame
 
     def start(self):
-        self.stop_event.clear()
-        self.transcription_thread = threading.Thread(target=self.transcribe)
-        self.transcription_thread.start()
+        with self.lock:
+            self.stop_event.clear()
+            self.transcription_thread = threading.Thread(target=self.transcribe)
+            self.transcription_thread.start()
 
     def stop(self):
-        self.stop_event.set()
-        if self.transcription_thread:
-            self.transcription_thread.join()
+        with self.lock:
+            self.stop_event.set()
+            if self.transcription_thread:
+                self.transcription_thread.join()
 
     def transcribe(self):
         loop = asyncio.new_event_loop()
@@ -123,8 +126,9 @@ def transcription_page():
 
     if webrtc_ctx.state.playing:
         if webrtc_ctx.audio_processor:
-            if not hasattr(webrtc_ctx.audio_processor, "transcription_thread") or not webrtc_ctx.audio_processor.transcription_thread.is_alive():
-                webrtc_ctx.audio_processor.start()
+            with webrtc_ctx.audio_processor.lock:
+                if not hasattr(webrtc_ctx.audio_processor, "transcription_thread") or not webrtc_ctx.audio_processor.transcription_thread.is_alive():
+                    webrtc_ctx.audio_processor.start()
     elif webrtc_ctx.audio_processor:
         webrtc_ctx.audio_processor.stop()
 
