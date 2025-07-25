@@ -1,4 +1,4 @@
 streamlit
 assemblyai
-pyaudio
 websockets==10.4
+streamlit-webrtc

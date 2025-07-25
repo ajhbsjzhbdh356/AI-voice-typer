@@ -1,97 +1,57 @@
 import streamlit as st
 import asyncio
 import websockets
-import base64
 import json
 import threading
 from configure import auth_key
-import pyaudio
 import time
 import queue
 import logging
 import os
 from datetime import datetime
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, AudioProcessorBase
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Use session state to manage the app's state
-if 'recording' not in st.session_state:
-    st.session_state.recording = False
 if 'full_transcript' not in st.session_state:
     st.session_state.full_transcript = []
-if 'thread' not in st.session_state:
-    st.session_state.thread = None
-if 'stop_event' not in st.session_state:
-    st.session_state.stop_event = threading.Event()
-if 'stream' not in st.session_state:
-    st.session_state.stream = None
 if 'error' not in st.session_state:
     st.session_state.error = None
-if 'device_index' not in st.session_state:
-    st.session_state.device_index = None
 if 'queue' not in st.session_state:
     st.session_state.queue = queue.Queue()
 
-FRAMES_PER_BUFFER = 3200
-FORMAT = pyaudio.paInt16
-CHANNELS = 1
-RATE = 16000
-URL = f"wss://streaming.assemblyai.com/v3/ws?sample_rate={RATE}"
+URL = f"wss://streaming.assemblyai.com/v3/ws?sample_rate=16000"
 LIBRARY_FILE = "library.json"
 
-p = pyaudio.PyAudio()
+class AudioProcessor(AudioProcessorBase):
+    def __init__(self):
+        self.audio_queue = queue.Queue()
+        self.stop_event = threading.Event()
+        self.transcription_thread = None
 
-def audio_stream_start():
-    try:
-        st.session_state.stream = p.open(
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=RATE,
-            input=True,
-            frames_per_buffer=FRAMES_PER_BUFFER,
-            input_device_index=st.session_state.device_index
-        )
-        return True
-    except Exception as e:
-        st.session_state.queue.put({"error": f"Failed to open audio stream: {e}"})
-        return False
+    def recv(self, frame):
+        self.audio_queue.put(frame.to_ndarray())
+        return frame
 
-async def send_receive(ws, stop_event, q, stream):
-    async def send():
-        while not stop_event.is_set():
-            try:
-                data = stream.read(FRAMES_PER_BUFFER, exception_on_overflow=False)
-                await ws.send(data)
-            except websockets.exceptions.ConnectionClosedOK:
-                break
-            except Exception as e:
-                q.put({"error": f"Send error: {e}"})
-                break
-            await asyncio.sleep(0.01)
+    def start(self):
+        self.stop_event.clear()
+        self.transcription_thread = threading.Thread(target=self.transcribe)
+        self.transcription_thread.start()
 
-    async def receive():
-        while not stop_event.is_set():
-            try:
-                result_str = await ws.recv()
-                logger.info(f"Received from AssemblyAI: {result_str}")
-                result_json = json.loads(result_str)
-                if "words" in result_json:
-                    q.put(result_json)
-            except websockets.exceptions.ConnectionClosedOK:
-                break
-            except Exception as e:
-                q.put({"error": f"Receive error: {e}"})
-                break
+    def stop(self):
+        self.stop_event.set()
+        if self.transcription_thread:
+            self.transcription_thread.join()
 
-    await asyncio.gather(send(), receive())
+    def transcribe(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(self._transcribe())
 
-def transcription_thread(stop_event, q, stream):
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    async def connect_ws():
+    async def _transcribe(self):
         try:
             async with websockets.connect(
                 URL,
@@ -99,41 +59,37 @@ def transcription_thread(stop_event, q, stream):
                 ping_interval=5,
                 ping_timeout=20
             ) as ws:
-                await send_receive(ws, stop_event, q, stream)
+                sender_task = asyncio.create_task(self.sender(ws))
+                receiver_task = asyncio.create_task(self.receiver(ws))
+                await asyncio.gather(sender_task, receiver_task)
         except Exception as e:
-            q.put({"error": f"WebSocket connection error: {e}"})
-        finally:
-            q.put({"status": "stopped"})
+            st.session_state.queue.put({"error": f"WebSocket connection error: {e}"})
 
-    loop.run_until_complete(connect_ws())
+    async def sender(self, ws):
+        while not self.stop_event.is_set():
+            try:
+                audio_chunk = self.audio_queue.get(timeout=1)
+                await ws.send(audio_chunk.tobytes())
+            except queue.Empty:
+                continue
+            except Exception as e:
+                st.session_state.queue.put({"error": f"Send error: {e}"})
+                break
+            await asyncio.sleep(0.01)
 
-def start_transcription():
-    if not auth_key or auth_key == "YOUR_ASSEMBLYAI_API_KEY":
-        st.session_state.error = "AssemblyAI API key is missing. Please add it to configure.py."
-        return
-
-    st.session_state.recording = True
-    st.session_state.error = None
-    st.session_state.full_transcript = []
-    st.session_state.stop_event.clear()
-
-    if not audio_stream_start():
-        st.session_state.recording = False
-        return
-
-    st.session_state.thread = threading.Thread(target=transcription_thread, args=(st.session_state.stop_event, st.session_state.queue, st.session_state.stream), daemon=True)
-    st.session_state.thread.start()
-
-def stop_transcription():
-    st.session_state.stop_event.set()
-    if st.session_state.thread:
-        st.session_state.thread.join(timeout=1)
-    if st.session_state.stream:
-        st.session_state.stream.stop_stream()
-        st.session_state.stream.close()
-        st.session_state.stream = None
-    st.session_state.recording = False
-    time.sleep(0.1)
+    async def receiver(self, ws):
+        while not self.stop_event.is_set():
+            try:
+                result_str = await ws.recv()
+                logger.info(f"Received from AssemblyAI: {result_str}")
+                result_json = json.loads(result_str)
+                if "words" in result_json:
+                    st.session_state.queue.put(result_json)
+            except websockets.exceptions.ConnectionClosedOK:
+                break
+            except Exception as e:
+                st.session_state.queue.put({"error": f"Receive error: {e}"})
+                break
 
 def save_to_library(transcript):
     if not os.path.exists(LIBRARY_FILE):
@@ -158,32 +114,21 @@ def load_library():
 def transcription_page():
     st.title("Real-time Speech Recognition")
 
-    if st.session_state.device_index is None:
-        try:
-            default_device_info = p.get_default_input_device_info()
-            st.session_state.device_index = default_device_info['index']
-        except IOError:
-            st.warning("No default audio input device found. Please ensure a microphone is connected and configured.")
-            return
+    webrtc_ctx = webrtc_streamer(
+        key="speech-to-text",
+        mode=WebRtcMode.SENDRECV,
+        audio_processor_factory=AudioProcessor,
+        media_stream_constraints={"video": False, "audio": True},
+    )
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        start_button = st.button("Start Transcription")
-    with col2:
-        stop_button = st.button("Stop Transcription")
-    with col3:
-        clear_button = st.button("Clear Transcript")
+    if webrtc_ctx.state.playing and webrtc_ctx.audio_processor:
+        if not hasattr(webrtc_ctx.audio_processor, "transcription_thread") or not webrtc_ctx.audio_processor.transcription_thread.is_alive():
+            webrtc_ctx.audio_processor.start()
 
-    if start_button and not st.session_state.recording:
-        start_transcription()
-        if not st.session_state.error:
-            st.success("Transcription started.")
-        st.rerun()
+    if not webrtc_ctx.state.playing and webrtc_ctx.audio_processor:
+        webrtc_ctx.audio_processor.stop()
 
-    if stop_button and st.session_state.recording:
-        stop_transcription()
-        st.rerun()
-
+    clear_button = st.button("Clear Transcript")
     if clear_button:
         st.session_state.full_transcript = []
         st.rerun()
@@ -192,7 +137,7 @@ def transcription_page():
     transcript_text = "\n\n".join(st.session_state.full_transcript)
     st.markdown(transcript_text)
 
-    if not st.session_state.recording and transcript_text:
+    if not webrtc_ctx.state.playing and transcript_text:
         if st.button("Save to Library"):
             save_to_library(transcript_text)
             st.success("Transcription saved to library.")
@@ -200,29 +145,21 @@ def transcription_page():
     if st.session_state.error:
         st.error(st.session_state.error)
 
-    if st.session_state.recording:
-        try:
-            message = st.session_state.queue.get_nowait()
-            if "words" in message:
-                turn_order = message.get("turn_order", -1)
-                words = message.get("words", [])
-                transcript = " ".join([word.get("text", "") for word in words])
-                if turn_order >= len(st.session_state.full_transcript):
-                    st.session_state.full_transcript.append(transcript)
-                else:
-                    st.session_state.full_transcript[turn_order] = transcript
-            if "error" in message:
-                st.session_state.error = message["error"]
-            if "status" in message and message["status"] == "stopped":
-                st.session_state.recording = False
-            st.rerun()
-        except queue.Empty:
-            if st.session_state.thread and not st.session_state.thread.is_alive():
-                st.session_state.recording = False
-                st.rerun()
+    try:
+        message = st.session_state.queue.get_nowait()
+        if "words" in message:
+            turn_order = message.get("turn_order", -1)
+            words = message.get("words", [])
+            transcript = " ".join([word.get("text", "") for word in words])
+            if turn_order >= len(st.session_state.full_transcript):
+                st.session_state.full_transcript.append(transcript)
             else:
-                time.sleep(0.1)
-                st.rerun()
+                st.session_state.full_transcript[turn_order] = transcript
+        if "error" in message:
+            st.session_state.error = message["error"]
+        st.rerun()
+    except queue.Empty:
+        pass
 
 def library_page():
     st.title("Transcription Library")
