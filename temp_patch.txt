@@ -1,0 +1,7 @@
+=======
+import pyaudio
+import asyncio
+import websockets
+import base64
+import json
+from configure import auth_key
