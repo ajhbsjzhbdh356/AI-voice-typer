@@ -121,11 +121,11 @@ def transcription_page():
         media_stream_constraints={"video": False, "audio": True},
     )
 
-    if webrtc_ctx.state.playing and webrtc_ctx.audio_processor:
-        if not hasattr(webrtc_ctx.audio_processor, "transcription_thread") or not webrtc_ctx.audio_processor.transcription_thread.is_alive():
-            webrtc_ctx.audio_processor.start()
-
-    if not webrtc_ctx.state.playing and webrtc_ctx.audio_processor:
+    if webrtc_ctx.state.playing:
+        if webrtc_ctx.audio_processor:
+            if not hasattr(webrtc_ctx.audio_processor, "transcription_thread") or not webrtc_ctx.audio_processor.transcription_thread.is_alive():
+                webrtc_ctx.audio_processor.start()
+    elif webrtc_ctx.audio_processor:
         webrtc_ctx.audio_processor.stop()
 
     clear_button = st.button("Clear Transcript")
